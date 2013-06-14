@@ -1,7 +1,9 @@
 package net.adamcin.granite.auth.sshkey;
 
+import com.adobe.granite.crypto.CryptoException;
+import com.adobe.granite.crypto.CryptoSupport;
+import com.day.crx.security.token.TokenCookie;
 import com.day.crx.security.token.TokenUtil;
-import org.apache.commons.codec.binary.Base64;
 import org.apache.felix.scr.annotations.Activate;
 import org.apache.felix.scr.annotations.Component;
 import org.apache.felix.scr.annotations.Deactivate;
@@ -26,11 +28,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 @Component(label = "SSH Key Authentication Handler", metatype = true)
 @Service
@@ -40,8 +41,8 @@ public final class SSHKeyAuthenticationHandler extends AbstractAuthenticationHan
     private static final String HEADER_AUTHENTICATE = "WWW-Authenticate";
     private static final String HEADER_AUTHORIZATION = "Authorization";
     private static final String AUTHORIZED_KEYS_REL_PATH = ".ssh/authorized_keys";
-    private static final String REQUEST_LOGIN_PARAMETER = "sling:authRequestLogin";
-    private static final String X_PREFER_AUTHENTICATE_HEADER = "X-Prefer-Authenticate";
+    public static final String X_SSHKEY_USERNAME_HEADER = "X-SSHKey-Username";
+    public static final String X_SSHKEY_FINGERPRINT_HEADER = "X-SSHKey-Fingerprint";
     private static final int MAX_SESSIONS = 10000;
 
     @Property(name = TYPE_PROPERTY, propertyPrivate = true)
@@ -66,12 +67,17 @@ public final class SSHKeyAuthenticationHandler extends AbstractAuthenticationHan
     @Reference
     private SlingRepository repository;
 
+    @Reference
+    private CryptoSupport cryptoSupport;
+
     private boolean disabled;
     private String authorizedKeysPath;
     private String realm;
 
-    private final Set<SSHPublicKey> authorizedKeys = Collections.synchronizedSet(new HashSet<SSHPublicKey>());
-    private final Map<String, Long> sessions = Collections.synchronizedMap(new HashMap<String, Long>());
+    private final Map<String, SSHPublicKey> authorizedKeys = Collections.synchronizedMap(
+            new HashMap<String, SSHPublicKey>()
+    );
+    private final Map<String, SSHKeySession> sessions = Collections.synchronizedMap(new HashMap<String, SSHKeySession>());
 
     @Activate
     protected void activate(ComponentContext ctx, Map<String, Object> props) {
@@ -83,7 +89,9 @@ public final class SSHKeyAuthenticationHandler extends AbstractAuthenticationHan
                 try {
                     authKeysStream = new FileInputStream(authorizedKeysFile);
                     List<SSHPublicKey> keys = SSHPublicKey.readKeys(new InputStreamReader(authKeysStream));
-                    authorizedKeys.addAll(keys);
+                    for (SSHPublicKey key : keys) {
+                        authorizedKeys.put(key.getFingerPrint(), key);
+                    }
                 } catch (IOException e) {
                     LOGGER.error("[activate] failed to read authorized_keys file: {}, exception: {}",
                                  authorizedKeysFile, e.getMessage());
@@ -150,7 +158,7 @@ public final class SSHKeyAuthenticationHandler extends AbstractAuthenticationHan
     public AuthenticationInfo extractCredentials(HttpServletRequest request,
                                                  HttpServletResponse response) {
 
-        if (isDisabled() || !isAllowedToLogin(request)) {
+        if (isDisabled() || !isAllowedToLogin(request) ) {
             return null;
         }
 
@@ -166,36 +174,54 @@ public final class SSHKeyAuthenticationHandler extends AbstractAuthenticationHan
         return null;
     }
 
-    protected static boolean sshKeyAuthPreferred(HttpServletRequest request) {
-        String preferHeader = request.getHeader(X_PREFER_AUTHENTICATE_HEADER);
-        return preferHeader != null && preferHeader.toLowerCase().contains(AUTH_TYPE.toLowerCase());
+    protected static String getSSHKeyUsername(HttpServletRequest request) {
+        return request.getHeader(X_SSHKEY_USERNAME_HEADER);
     }
 
     protected boolean forceAuthentication(HttpServletRequest request,
                                           HttpServletResponse response) {
 
         boolean authenticationForced = false;
-        if (request.getParameter(REQUEST_LOGIN_PARAMETER) != null || sshKeyAuthPreferred(request)) {
+        String username = getSSHKeyUsername(request);
+        if (username != null) {
             if (!response.isCommitted()) {
-                authenticationForced = sendUnauthorized(request, response);
+                authenticationForced = sendUnauthorized(username, request, response);
             }
         }
 
         return authenticationForced;
     }
 
-    protected boolean sendUnauthorized(HttpServletRequest request,
+    protected String selectFingerprint(String username, HttpServletRequest request) {
+        Enumeration fingerprints = request.getHeaders(X_SSHKEY_FINGERPRINT_HEADER);
+        if (fingerprints != null) {
+            while (fingerprints.hasMoreElements()) {
+                String fingerprint = (String) fingerprints.nextElement();
+                if (authorizedKeys.containsKey(fingerprint)) {
+                    return fingerprint;
+                }
+            }
+        }
+        return null;
+    }
+
+    protected boolean sendUnauthorized(String username, HttpServletRequest request,
                                           HttpServletResponse response) {
         if (response.isCommitted()) {
             return false;
         }
 
-        String sessionId = createSessionId(request);
+        String fingerprint = selectFingerprint(username, request);
+        SSHKeySession session = createSession(username, fingerprint, request);
 
-        if (sessionId != null) {
+        if (session != null) {
             response.reset();
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-            response.setHeader(HEADER_AUTHENTICATE, AUTH_TYPE + " realm=\"" + this.realm + "\"" + ", sessionId=\"" + sessionId + "\"");
+
+            String headerValue = String.format("%s realm=\"%s\", fingerprint=\"%s\", sessionId=\"%s\"",
+                                               AUTH_TYPE, this.realm, fingerprint, session.getSessionId());
+
+            response.setHeader(HEADER_AUTHENTICATE, headerValue);
             try {
                 response.flushBuffer();
                 return true;
@@ -207,43 +233,32 @@ public final class SSHKeyAuthenticationHandler extends AbstractAuthenticationHan
         return false;
     }
 
-    protected String createSessionId(HttpServletRequest request) {
+    protected SSHKeySession createSession(String username, String fingerprint, HttpServletRequest request) {
         if (sessions.size() < MAX_SESSIONS) {
-            Long timestamp = System.currentTimeMillis();
-            String constructed = String.valueOf(timestamp) + " " + constructBaseSessionId(request);
-            String sessionId = Base64.encodeBase64URLSafeString(constructed.getBytes());
-            synchronized (this.sessions) {
-                this.sessions.put(sessionId, timestamp);
+            try {
+                SSHKeySession session = SSHKeySession.createSession(cryptoSupport, username, fingerprint, realm, request);
+                synchronized (this.sessions) {
+                    this.sessions.put(session.getSessionId(), session);
+                }
+                return session;
+            } catch (CryptoException e) {
+                LOGGER.error("[createSession] failed to encrypt session");
             }
-            return sessionId;
         }
         return null;
     }
 
-    protected String constructBaseSessionId(HttpServletRequest request) {
-        StringBuilder builder = new StringBuilder();
-        builder.append(request.getRemoteAddr()).append(",")
-                .append(request.getServerName()).append(":")
-                .append(request.getServerPort()).append("|")
-                .append(this.realm);
-        return builder.toString();
-
-    }
-
-    protected boolean validateSessionId(HttpServletRequest request, String sessionId) {
-        String base = constructBaseSessionId(request);
-        String sessionIdDecoded = new String(Base64.decodeBase64(sessionId));
-        int firstSpace = sessionIdDecoded.indexOf(' ');
-        if (firstSpace > 0 && sessionIdDecoded.substring(firstSpace + 1).equals(base)) {
+    protected SSHKeySession validateSession(HttpServletRequest request, String sessionId) {
+        if (this.sessions.containsKey(sessionId)) {
             synchronized (this.sessions) {
-                Long timestamp = this.sessions.remove(sessionId);
-                if (timestamp != null && System.currentTimeMillis() - timestamp < 60L * 1000L) {
-                    return true;
+                SSHKeySession session = this.sessions.remove(sessionId);
+                if (session != null && session.validateRequest(request, 60L * 1000L)) {
+                    return session;
                 }
             }
         }
 
-        return false;
+        return null;
     }
 
     public boolean requestCredentials(HttpServletRequest request, HttpServletResponse response)
@@ -259,20 +274,6 @@ public final class SSHKeyAuthenticationHandler extends AbstractAuthenticationHan
 
     public boolean isDisabled() {
         return disabled || authorizedKeys.isEmpty();
-    }
-
-    /**
-     *
-     * @param request
-     * @param response
-     * @return
-     */
-    public AuthenticationInfo handleSecretRequest(HttpServletRequest request,
-                                                 HttpServletResponse response) {
-
-
-
-        return AuthenticationInfo.DOING_AUTH;
     }
 
     public AuthenticationInfo handleLogin(HttpServletRequest request,
@@ -296,19 +297,22 @@ public final class SSHKeyAuthenticationHandler extends AbstractAuthenticationHan
             return null;
         }
 
-
         AuthenticationInfo info = null;
 
-        SSHKeyAuthPacketImpl packet = SSHKeyAuthPacketImpl.parse(authInfo);
+        AuthorizationPacketImpl packet = AuthorizationPacketImpl.parse(authInfo);
 
-        SSHPublicKey publicKey = SSHPublicKey.createKey(packet.getFormat(), packet.getKey());
-        boolean keyAuthorized = authorizedKeys.contains(publicKey);
-        boolean sessionIdValid = validateSessionId(request, packet.getSessionId());
-        boolean signatureValid = SSHPublicKey.verify(packet);
+        SSHKeySession session = validateSession(request, packet.getSessionId());
 
-        if (keyAuthorized && sessionIdValid && signatureValid) {
+        SSHPublicKey publicKey = this.authorizedKeys.get(session.getFingerprint());
+
+        boolean signatureValid = publicKey != null && publicKey.verify(packet);
+
+        if (signatureValid) {
             try {
-                info = TokenUtil.createCredentials(request, response, repository, packet.getUsername(), false);
+                if (request.getAttribute(TokenCookie.class.getName()) != null) {
+                    request.setAttribute(TokenCookie.class.getName(), null);
+                }
+                info = TokenUtil.createCredentials(request, response, repository, session.getUsername(), false);
             } catch (RepositoryException e) {
                 LOGGER.error("[handleLogin] failed to create token", e);
             }

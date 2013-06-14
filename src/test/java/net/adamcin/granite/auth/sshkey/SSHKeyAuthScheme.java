@@ -2,7 +2,6 @@ package net.adamcin.granite.auth.sshkey;
 
 import com.jcraft.jsch.Identity;
 import com.jcraft.jsch.JSch;
-import com.jcraft.jsch.JSchException;
 import org.apache.commons.codec.binary.Base64;
 import org.apache.http.Header;
 import org.apache.http.HttpRequest;
@@ -16,66 +15,30 @@ import org.apache.http.util.CharArrayBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
-import java.util.Vector;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/**
- * Created with IntelliJ IDEA.
- * User: madamcin
- * Date: 6/13/13
- * Time: 12:52 PM
- * To change this template use File | Settings | File Templates.
- */
 public class SSHKeyAuthScheme extends AuthSchemeBase {
     private static final Logger LOGGER = LoggerFactory.getLogger(SSHKeyAuthScheme.class);
     private static final Pattern REALM_PATTERN = Pattern.compile("realm=\"([^\"]*)\"");
+    private static final Pattern FINGERPRINT_PATTERN = Pattern.compile("fingerprint=\"([^\"]*)\"");
     private static final Pattern SESSIONID_PATTERN = Pattern.compile("sessionId=\"([^\"\\s]*)\"");
 
-    public static final String HTTP_PARAM_SSHKEY_USERNAME = "sshkey.username";
-    public static final String HTTP_PARAM_SSHKEY_IDENTITY = "sshkey.identity";
-    public static final String HTTP_PARAM_SSHKEY_PASSPHRASE = "sshkey.passphrase";
-    public static final String PARAM_SESSION_ID = "sessionId";
+    public static final String HTTP_PARAM_SSHKEY_IDENTITITES = "sshkey.identities";
+    public static final String CHALLENGE_PARAM_FINGERPRINT = "fingerprint";
+    public static final String CHALLENGE_PARAM_SESSION_ID = "sessionId";
 
     private String realm;
     private Map<String, String> params = new HashMap<String, String>();
     private JSch jSch;
-    private String username;
-    private String identity;
-    private String passphrase;
-    private List<Identity> identities = new ArrayList<Identity>();
+    // Fingerprint, Identity
+    private Map<String, Identity> identities;
 
-    public SSHKeyAuthScheme(HttpParams httpParams) {
+    public SSHKeyAuthScheme(HttpParams httpParams, Map<String, Identity> identities) {
         this.jSch = new JSch();
-        this.username = (String) httpParams.getParameter(HTTP_PARAM_SSHKEY_USERNAME);
-        this.identity = (String) httpParams.getParameter(HTTP_PARAM_SSHKEY_IDENTITY);
-        this.passphrase = (String) httpParams.getParameter(HTTP_PARAM_SSHKEY_PASSPHRASE);
-    }
-
-    protected void reloadIdentities() {
-        this.identities.clear();
-
-        if (identity != null) {
-            try {
-                if (this.passphrase != null) {
-                    this.jSch.addIdentity(identity, this.passphrase);
-                } else {
-                    this.jSch.addIdentity(identity);
-                }
-            } catch (JSchException e) {
-                System.err.println("Failed to add identity: " + identity + ". Reason: " + e.getMessage());
-            }
-        }
-
-        Vector _identities = this.jSch.getIdentityRepository().getIdentities();
-        for (Object obj : _identities) {
-            Identity ident = (Identity) obj;
-            this.identities.add(ident);
-        }
+        this.identities = identities;
     }
 
     @Override
@@ -83,14 +46,17 @@ public class SSHKeyAuthScheme extends AuthSchemeBase {
             throws MalformedChallengeException {
 
         String challenge = buffer.substring(beginIndex, endIndex);
+        LOGGER.error("[parseChallenge] challenge: {}", challenge);
 
         Matcher realmMatcher = REALM_PATTERN.matcher(challenge);
+        Matcher fingerprintMatcher = FINGERPRINT_PATTERN.matcher(challenge);
         Matcher sessionIdMatcher = SESSIONID_PATTERN.matcher(challenge);
-        if (realmMatcher.find() && sessionIdMatcher.find()) {
+        if (realmMatcher.find() && fingerprintMatcher.find() && sessionIdMatcher.find()) {
             this.realm = realmMatcher.group(1);
+            String fingerprint = fingerprintMatcher.group(1);
+            params.put(CHALLENGE_PARAM_FINGERPRINT, fingerprint);
             String sessionId = sessionIdMatcher.group(1);
-            params.put(PARAM_SESSION_ID, sessionId);
-            this.reloadIdentities();
+            params.put(CHALLENGE_PARAM_SESSION_ID, sessionId);
         } else {
             throw new MalformedChallengeException("Challenge must include realm and sessionId");
         }
@@ -113,22 +79,17 @@ public class SSHKeyAuthScheme extends AuthSchemeBase {
     }
 
     public boolean isComplete() {
-        return identities.isEmpty();
+        return true;
     }
 
     public Header authenticate(Credentials credentials, HttpRequest request) throws AuthenticationException {
-        String loginAs = this.username;
-        if (loginAs == null) {
-            loginAs = credentials != null ? credentials.getUserPrincipal().getName() : "admin";
-        }
+        Identity identity = this.identities.get(this.getParameter(CHALLENGE_PARAM_FINGERPRINT));
 
-        if (!this.identities.isEmpty()) {
-            Identity identity = this.identities.remove(0);
-            String pubKeyBlob = Base64.encodeBase64URLSafeString(identity.getPublicKeyBlob());
-            String payload = this.getParameter(PARAM_SESSION_ID) + " " + loginAs + " " + identity.getAlgName() + " " + pubKeyBlob;
+        if (identity != null) {
+            String sessionId = this.getParameter(CHALLENGE_PARAM_SESSION_ID);
 
-            String signature = Base64.encodeBase64URLSafeString(identity.getSignature(payload.getBytes()));
-            String headerValue = "SSHKey " + payload + " " + signature;
+            String signature = Base64.encodeBase64URLSafeString(identity.getSignature(sessionId.getBytes()));
+            String headerValue = "SSHKey " + sessionId + " " + signature;
             return new BasicHeader("Authorization", headerValue);
         } else {
             return null;

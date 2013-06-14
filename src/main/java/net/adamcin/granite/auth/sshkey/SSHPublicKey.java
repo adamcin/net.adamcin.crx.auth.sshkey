@@ -1,6 +1,8 @@
 package net.adamcin.granite.auth.sshkey;
 
+import com.jcraft.jsch.HASH;
 import com.jcraft.jsch.Signature;
+import com.jcraft.jsch.jce.MD5;
 import org.apache.commons.codec.binary.Base64;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,7 +18,7 @@ import java.util.regex.Pattern;
 
 abstract class SSHPublicKey {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(SSHKeyAuthPacketImpl.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(AuthorizationPacketImpl.class);
     private static final String CHARSET = "ISO-8859-1";
     private static final Pattern KEY_PATTERN = Pattern.compile("^([^\\s]+)\\s+([^\\s]+)(\\s|$)");
     private static final int GROUP_FORMAT = 1;
@@ -32,12 +34,10 @@ abstract class SSHPublicKey {
         this.key = Base64.decodeBase64(encodedKey);
     }
 
-    public static boolean verify(SSHKeyAuthPacket packet) {
+    public boolean verify(AuthorizationPacket packet) {
         if (packet != null) {
             try {
-                SSHPublicKey key = createKey(packet.getFormat(), packet.getKey());
-
-                Signature sig = key.getSignature();
+                Signature sig = this.getSignature();
                 sig.update(packet.toString().getBytes());
                 return sig.verify(Base64.decodeBase64(packet.getSignature()));
             } catch (Exception e) {
@@ -49,6 +49,7 @@ abstract class SSHPublicKey {
 
     public abstract Signature getSignature();
 
+
     @Override
     public abstract boolean equals(Object obj);
 
@@ -58,6 +59,15 @@ abstract class SSHPublicKey {
     @Override
     public String toString() {
         return format + " " + encodedKey;
+    }
+
+    public String getFingerPrint() {
+        try {
+            return FingerPrintUtil.getKeyFingerPrint(key);
+        } catch (Exception e) {
+            LOGGER.error("[getFingerPrint] Exception", e);
+        }
+        return null;
     }
 
     public static List<SSHPublicKey> readKeys(Reader reader) throws IOException {

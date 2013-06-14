@@ -36,13 +36,13 @@ public class SSHRSAPublicKeyTest {
                                     SSHKeyTestUtil.getPublicKeyAsFile("b2048")))).get(0);
 
 
-            MockSSHKeyAuthPacket packet = new MockSSHKeyAuthPacket(sessionId, "admin", key.format, key.encodedKey);
+            MockAuthorizationPacket packet = new MockAuthorizationPacket(sessionId);
 
             String sig = sign(packet.toString(), "b2048");
 
             packet.setSignature(sig);
 
-            assertTrue("should round trip", SSHPublicKey.verify(packet));
+            assertTrue("should round trip", key.verify(packet));
         } catch (Exception e) {
             FailUtil.sprintFail(e);
         } finally {
